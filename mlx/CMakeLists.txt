@@ -27,11 +27,6 @@ target_include_directories(mlx_version PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(mlx PRIVATE $<BUILD_INTERFACE:mlx_version>)
 
 # Do not export symbols by default.
-set_target_properties(
-  mlx mlx_version
-  PROPERTIES VISIBILITY_INLINES_HIDDEN ON
-             CXX_VISIBILITY_PRESET hidden
-             CUDA_VISIBILITY_PRESET hidden)
 
 # Define MLX_EXPORT for shared libraries, MLX_STATIC for static libraries.
 set_target_properties(mlx PROPERTIES DEFINE_SYMBOL MLX_EXPORT)
