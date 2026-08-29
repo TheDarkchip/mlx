@@ -206,7 +206,8 @@ __global__ void strided_scan(
     U* out,
     int32_t axis_size,
     int64_t stride,
-    int64_t stride_blocks) {
+    int64_t stride_blocks,
+    int64_t data_size) {
   auto grid = cg::this_grid();
   auto block = cg::this_thread_block();
   auto warp = cg::tiled_partition<WARP_SIZE>(block);
@@ -226,16 +227,34 @@ __global__ void strided_scan(
   }
 
   // Compute offsets.
-  int64_t offset = (grid.block_rank() / stride_blocks) * axis_size * stride;
+  int64_t scan_idx = grid.block_rank() / stride_blocks;
+  int64_t scan_size = axis_size * stride;
+  if (scan_idx > (data_size - 1) / scan_size) {
+    return;
+  }
+  int64_t offset = scan_idx * scan_size;
   int64_t global_index_x = (grid.block_rank() % stride_blocks) * BN;
+  // A valid scan column must have an element in the last row.
+  int64_t last_row_offset = (axis_size - 1) * stride;
+  int64_t scan_data_size = data_size - offset;
+  if (last_row_offset >= scan_data_size) {
+    return;
+  }
+  int64_t available_width = scan_data_size - last_row_offset;
+  int64_t scan_width = stride < available_width ? stride : available_width;
+  if (global_index_x >= scan_width) {
+    return;
+  }
   uint32_t read_offset_y = (block.thread_rank() * N_READS) / BN;
   uint32_t read_offset_x = (block.thread_rank() * N_READS) % BN;
   uint32_t scan_offset_y = warp.thread_rank();
   uint32_t scan_offset_x = warp.meta_group_rank() * n_scans;
 
-  uint32_t stride_limit = stride - global_index_x;
-  in += offset + global_index_x + read_offset_x;
-  out += offset + global_index_x + read_offset_x;
+  int64_t stride_limit = scan_width - global_index_x;
+  // Tail blocks still have lanes for all BN columns, so some offsets exceed the
+  // remaining width. Guard these offsets to keep the base pointers valid.
+  in += offset + global_index_x;
+  out += offset + global_index_x;
   U* read_into = read_buffer + read_offset_y * BN_pad + read_offset_x;
   U* read_from = read_buffer + scan_offset_y * BN_pad + scan_offset_x;
 
@@ -248,14 +267,14 @@ __global__ void strided_scan(
     }
 
     // Read in SM.
-    if (check_index_y < axis_size && (read_offset_x + N_READS) < stride_limit) {
+    if (check_index_y < axis_size && (read_offset_x + N_READS) <= stride_limit) {
       for (int i = 0; i < N_READS; ++i) {
-        read_into[i] = in[index_y * stride + i];
+        read_into[i] = in[index_y * stride + read_offset_x + i];
       }
     } else {
       for (int i = 0; i < N_READS; ++i) {
         if (check_index_y < axis_size && (read_offset_x + i) < stride_limit) {
-          read_into[i] = in[index_y * stride + i];
+          read_into[i] = in[index_y * stride + read_offset_x + i];
         } else {
           read_into[i] = init;
         }
@@ -284,14 +303,14 @@ __global__ void strided_scan(
     // Write to device memory.
     if (!inclusive) {
       if (check_index_y == 0) {
-        if ((read_offset_x + N_READS) < stride_limit) {
+        if ((read_offset_x + N_READS) <= stride_limit) {
           for (int i = 0; i < N_READS; ++i) {
-            out[index_y * stride + i] = init;
+            out[index_y * stride + read_offset_x + i] = init;
           }
         } else {
           for (int i = 0; i < N_READS; ++i) {
             if ((read_offset_x + i) < stride_limit) {
-              out[index_y * stride + i] = init;
+              out[index_y * stride + read_offset_x + i] = init;
             }
           }
         }
@@ -304,14 +323,14 @@ __global__ void strided_scan(
         check_index_y += 1;
       }
     }
-    if (check_index_y < axis_size && (read_offset_x + N_READS) < stride_limit) {
+    if (check_index_y < axis_size && (read_offset_x + N_READS) <= stride_limit) {
       for (int i = 0; i < N_READS; ++i) {
-        out[index_y * stride + i] = read_into[i];
+        out[index_y * stride + read_offset_x + i] = read_into[i];
       }
     } else {
       for (int i = 0; i < N_READS; ++i) {
         if (check_index_y < axis_size && (read_offset_x + i) < stride_limit) {
-          out[index_y * stride + i] = read_into[i];
+          out[index_y * stride + read_offset_x + i] = read_into[i];
         }
       }
     }
@@ -417,10 +436,20 @@ void scan_gpu_inplace(
                   BN,
                   inclusive_tag.value,
                   reverse_tag.value>;
-              int64_t stride = in.strides()[axis];
-              int64_t stride_blocks = cuda::ceil_div(stride, BN);
-              dim3 num_blocks = get_2d_grid_dims(
-                  in.shape(), in.strides(), axis_size * stride);
+              auto data_size = out.data_size();
+              // Treat a size-one axis as one scan over the full buffer.
+              int64_t stride = axis_size == 1 ? static_cast<int64_t>(data_size)
+                                              : in.strides()[axis];
+              int64_t last_row_offset = (axis_size - 1) * stride;
+              int64_t scan_width = std::min(
+                  stride, static_cast<int64_t>(data_size) - last_row_offset);
+              int64_t stride_blocks =
+                  cuda::ceil_div(scan_width, static_cast<int64_t>(BN));
+              auto grid_divisor = std::min(
+                  static_cast<size_t>(axis_size) * static_cast<size_t>(stride),
+                  data_size);
+              dim3 num_blocks =
+                  get_2d_grid_dims(in.shape(), in.strides(), grid_divisor);
               if (num_blocks.x * stride_blocks <= UINT32_MAX) {
                 num_blocks.x *= stride_blocks;
               } else {
@@ -435,7 +464,8 @@ void scan_gpu_inplace(
                   gpu_ptr<U>(out),
                   axis_size,
                   stride,
-                  stride_blocks);
+                  stride_blocks,
+                  static_cast<int64_t>(data_size));
             }
           });
         });
@@ -463,6 +493,14 @@ void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
+  // An inclusive scan over a size-one axis only needs a cast-copy.
+  bool supports_scan =
+      reduce_type_ != Scan::LogAddExp || issubdtype(in.dtype(), inexact);
+  if (in.shape(axis_) == 1 && inclusive_ && supports_scan) {
+    auto ctype = in.flags().contiguous ? CopyType::Vector : CopyType::General;
+    copy_gpu(in, out, ctype, s);
+    return;
+  }
   if (in.flags().contiguous && in.strides()[axis_] != 0) {
     if (in.is_donatable() && in.itemsize() == out.itemsize()) {
       out.copy_shared_buffer(in);

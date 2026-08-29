@@ -413,6 +413,7 @@ template <
     const constant size_t& axis_size [[buffer(2)]],
     const constant size_t& stride [[buffer(3)]],
     const constant size_t& stride_blocks [[buffer(4)]],
+    const constant size_t& data_size [[buffer(5)]],
     uint3 gid [[threadgroup_position_in_grid]],
     uint3 gsize [[threadgroups_per_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
@@ -435,16 +436,33 @@ template <
 
   // Compute offsets
   size_t full_gid = gid.y + gsize.y * size_t(gid.z);
-  size_t offset = full_gid / stride_blocks * axis_size * stride;
+  size_t scan_idx = full_gid / stride_blocks;
+  size_t scan_size = axis_size * stride;
+  if (scan_idx > (data_size - 1) / scan_size) {
+    return;
+  }
+  size_t offset = scan_idx * scan_size;
   size_t global_index_x = full_gid % stride_blocks * BN;
+  // A valid scan column must have an element in the last row.
+  size_t last_row_offset = (axis_size - 1) * stride;
+  size_t scan_data_size = data_size - offset;
+  if (last_row_offset >= scan_data_size) {
+    return;
+  }
+  size_t scan_width = min(stride, scan_data_size - last_row_offset);
+  if (global_index_x >= scan_width) {
+    return;
+  }
   uint read_offset_y = (lid.x * N_READS) / BN;
   uint read_offset_x = (lid.x * N_READS) % BN;
   uint scan_offset_y = simd_lane_id;
   uint scan_offset_x = simd_group_id * n_scans;
 
-  uint stride_limit = stride - global_index_x;
-  in += offset + global_index_x + read_offset_x;
-  out += offset + global_index_x + read_offset_x;
+  size_t stride_limit = scan_width - global_index_x;
+  // Tail blocks still have lanes for all BN columns, so some offsets exceed the
+  // remaining width. Guard these offsets to keep the base pointers valid.
+  in += offset + global_index_x;
+  out += offset + global_index_x;
   threadgroup U* read_into =
       read_buffer + read_offset_y * BN_pad + read_offset_x;
   threadgroup U* read_from =
@@ -460,14 +478,15 @@ template <
 
     // Read in SM
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (check_index_y < axis_size && (read_offset_x + N_READS) < stride_limit) {
+    if (check_index_y < axis_size &&
+        (read_offset_x + N_READS) <= stride_limit) {
       for (int i = 0; i < N_READS; i++) {
-        read_into[i] = in[index_y * stride + i];
+        read_into[i] = in[index_y * stride + read_offset_x + i];
       }
     } else {
       for (int i = 0; i < N_READS; i++) {
         if (check_index_y < axis_size && (read_offset_x + i) < stride_limit) {
-          read_into[i] = in[index_y * stride + i];
+          read_into[i] = in[index_y * stride + read_offset_x + i];
         } else {
           read_into[i] = Op::init;
         }
@@ -497,14 +516,14 @@ template <
     // Write to device memory
     if (!inclusive) {
       if (check_index_y == 0) {
-        if ((read_offset_x + N_READS) < stride_limit) {
+        if ((read_offset_x + N_READS) <= stride_limit) {
           for (int i = 0; i < N_READS; i++) {
-            out[index_y * stride + i] = Op::init;
+            out[index_y * stride + read_offset_x + i] = Op::init;
           }
         } else {
           for (int i = 0; i < N_READS; i++) {
             if ((read_offset_x + i) < stride_limit) {
-              out[index_y * stride + i] = Op::init;
+              out[index_y * stride + read_offset_x + i] = Op::init;
             }
           }
         }
@@ -517,14 +536,15 @@ template <
         check_index_y += 1;
       }
     }
-    if (check_index_y < axis_size && (read_offset_x + N_READS) < stride_limit) {
+    if (check_index_y < axis_size &&
+        (read_offset_x + N_READS) <= stride_limit) {
       for (int i = 0; i < N_READS; i++) {
-        out[index_y * stride + i] = read_into[i];
+        out[index_y * stride + read_offset_x + i] = read_into[i];
       }
     } else {
       for (int i = 0; i < N_READS; i++) {
         if (check_index_y < axis_size && (read_offset_x + i) < stride_limit) {
-          out[index_y * stride + i] = read_into[i];
+          out[index_y * stride + read_offset_x + i] = read_into[i];
         }
       }
     }

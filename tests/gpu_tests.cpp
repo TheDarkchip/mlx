@@ -74,6 +74,39 @@ TEST_CASE("test gpu strided scan grid") {
   CHECK(array_equal(causal, expected, Device::cpu).item<bool>());
 }
 
+TEST_CASE("test gpu strided scan bounds") {
+  for (auto [n, offset] : std::array{std::pair{64, 63}, std::pair{512, 400}}) {
+    CAPTURE(n);
+    CAPTURE(offset);
+    auto base =
+        reshape(arange(1.0, n + 1.0, 1.0, float32, Device::gpu), {1, n});
+    std::vector<array> canaries;
+    std::vector<array> allocations{base};
+    for (int i = 0; i < 12; ++i) {
+      canaries.push_back(full({16}, static_cast<float>(i), Device::gpu));
+      allocations.push_back(canaries.back());
+    }
+    eval(allocations);
+
+    auto out =
+        cumsum(slice(base, {0, offset}, {1, n}), 0, false, false, Device::gpu);
+    eval(out);
+    CHECK_EQ(out.data_size(), n - offset);
+    CHECK_EQ(out.strides()[0], n);
+
+    auto expected = zeros({1, n - offset}, float32, Device::cpu);
+    CHECK(array_equal(out, expected, Device::cpu).item<bool>());
+    auto expected_base =
+        reshape(arange(1.0, n + 1.0, 1.0, float32, Device::cpu), {1, n});
+    CHECK(array_equal(base, expected_base, Device::cpu).item<bool>());
+    for (size_t i = 0; i < canaries.size(); ++i) {
+      auto expected_canary = full({16}, static_cast<float>(i), Device::cpu);
+      CHECK(
+          array_equal(canaries[i], expected_canary, Device::cpu).item<bool>());
+    }
+  }
+}
+
 TEST_CASE("test gpu astype") {
   array x = array({-4, -3, -2, -1, 0, 1, 2, 3});
   // Check all types work

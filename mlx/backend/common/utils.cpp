@@ -227,7 +227,7 @@ Dims get_2d_grid_dims_common(
     std::swap(grid_x, grid_y);
   }
   if (divisor > 1) {
-    grid_x = ((grid_x + divisor - 1) / divisor) * divisor;
+    grid_x = grid_x / divisor + (grid_x % divisor != 0);
   }
   return std::make_tuple(
       static_cast<uint32_t>(grid_x), static_cast<uint32_t>(grid_y), 1);

@@ -2688,7 +2688,7 @@ class TestOps(mlx_tests.MLXTestCase):
     def test_scan_size_one_axis(self):
         # A size one axis can carry any stride and still be row contiguous, so
         # the scan must not take its row count from that stride.
-        for op in ["cumsum", "cumprod", "cummax", "cummin"]:
+        for op in ["cumsum", "cumprod", "cummax", "cummin", "logcumsumexp"]:
             for start in (1, 2, 3):
                 with self.subTest(op=op, start=start):
                     base = mx.arange(1, 11, dtype=mx.float32).reshape(1, 10)

@@ -89,18 +89,24 @@ void scan_gpu_inplace(
     MTL::Size group_dims(thread_group_size, 1, 1);
     compute_encoder.dispatch_threads(grid_dims, group_dims);
   } else {
-    size_t stride = in.strides()[axis];
+    size_t data_size = out.data_size();
+    // Treat a size-one axis as one scan over the full buffer.
+    size_t stride = size == 1 ? data_size : in.strides()[axis];
+    size_t last_row_offset = (size - 1) * stride;
+    size_t scan_width = std::min(stride, data_size - last_row_offset);
     int bn = 32;
-    size_t stride_blocks = (stride + bn - 1) / bn;
+    size_t stride_blocks = (scan_width + bn - 1) / bn;
     compute_encoder.set_bytes(stride, 3);
     compute_encoder.set_bytes(stride_blocks, 4);
+    compute_encoder.set_bytes(data_size, 5);
 
     // Compute the thread grid
     int n_reads = (in.itemsize() <= 4) ? 4 : 2;
     int n_simdgroups = bn / n_reads;
     int thread_group_size = n_simdgroups * 32;
+    auto grid_divisor = std::min(size * stride, data_size);
     auto tmp_grid_dims =
-        get_2d_grid_dims(in.shape(), in.strides(), /*divisor=*/size * stride);
+        get_2d_grid_dims(in.shape(), in.strides(), /*divisor=*/grid_divisor);
     if (tmp_grid_dims.width * stride_blocks <= UINT_MAX) {
       tmp_grid_dims.width *= stride_blocks;
     } else {
@@ -122,6 +128,14 @@ void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   auto in = inputs[0];
+  // An inclusive scan over a size-one axis only needs a cast-copy.
+  bool supports_scan =
+      reduce_type_ != Scan::LogAddExp || issubdtype(in.dtype(), inexact);
+  if (in.shape(axis_) == 1 && inclusive_ && supports_scan) {
+    auto ctype = in.flags().contiguous ? CopyType::Vector : CopyType::General;
+    copy_gpu(in, out, ctype, stream());
+    return;
+  }
   if (in.flags().contiguous && in.strides()[axis_] != 0) {
     if (in.is_donatable() && in.itemsize() == out.itemsize()) {
       out.copy_shared_buffer(in);
