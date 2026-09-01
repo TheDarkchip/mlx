@@ -463,7 +463,7 @@ template <
 
     // Read in SM
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (check_index_y < axis_size && (read_offset_x + N_READS) < stride_limit) {
+    if (check_index_y < axis_size && (read_offset_x + N_READS) <= stride_limit) {
       for (int i = 0; i < N_READS; i++) {
         read_into[i] = in[index_y * stride + i];
       }
@@ -500,7 +500,7 @@ template <
     // Write to device memory
     if (!inclusive) {
       if (check_index_y == 0) {
-        if ((read_offset_x + N_READS) < stride_limit) {
+        if ((read_offset_x + N_READS) <= stride_limit) {
           for (int i = 0; i < N_READS; i++) {
             out[index_y * stride + i] = Op::init;
           }
@@ -520,7 +520,7 @@ template <
         check_index_y += 1;
       }
     }
-    if (check_index_y < axis_size && (read_offset_x + N_READS) < stride_limit) {
+    if (check_index_y < axis_size && (read_offset_x + N_READS) <= stride_limit) {
       for (int i = 0; i < N_READS; i++) {
         out[index_y * stride + i] = read_into[i];
       }
